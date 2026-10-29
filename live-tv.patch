@@ -1,0 +1,380 @@
+diff -ruN a/hume-launcher-main/AndroidManifest.xml b/hume-launcher-main/AndroidManifest.xml
+--- a/hume-launcher-main/AndroidManifest.xml	2026-10-28 20:02:03.000000000 +0000
++++ b/hume-launcher-main/AndroidManifest.xml	2026-10-29 10:05:29.254592192 +0000
+@@ -119,6 +119,17 @@
+             </intent-filter>
+         </receiver>
+ 
++        <!-- Live TV: the IPTV website in an embedded WebView (its own player). -->
++        <activity
++            android:name=".LiveTvActivity"
++            android:exported="false"
++            android:launchMode="singleTask"
++            android:excludeFromRecents="true"
++            android:hardwareAccelerated="true"
++            android:screenOrientation="landscape"
++            android:theme="@style/HomeTheme"
++            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|smallestScreenSize|screenLayout|uiMode|density" />
++
+         <activity
+             android:name=".SetupActivity"
+             android:exported="true"
+diff -ruN a/hume-launcher-main/src/com/petrobot/hume/LiveTvActivity.java b/hume-launcher-main/src/com/petrobot/hume/LiveTvActivity.java
+--- a/hume-launcher-main/src/com/petrobot/hume/LiveTvActivity.java	1970-01-01 00:00:00.000000000 +0000
++++ b/hume-launcher-main/src/com/petrobot/hume/LiveTvActivity.java	2026-10-29 10:05:29.257085913 +0000
+@@ -0,0 +1,290 @@
++package com.petrobot.hume;
++
++import android.app.Activity;
++import android.graphics.Color;
++import android.graphics.Typeface;
++import android.graphics.drawable.GradientDrawable;
++import android.net.http.SslError;
++import android.os.Bundle;
++import android.view.Gravity;
++import android.view.KeyEvent;
++import android.view.View;
++import android.view.ViewGroup;
++import android.webkit.CookieManager;
++import android.webkit.PermissionRequest;
++import android.webkit.SslErrorHandler;
++import android.webkit.WebChromeClient;
++import android.webkit.WebResourceError;
++import android.webkit.WebResourceRequest;
++import android.webkit.WebResourceResponse;
++import android.webkit.WebSettings;
++import android.webkit.WebView;
++import android.webkit.WebViewClient;
++import android.widget.FrameLayout;
++import android.widget.LinearLayout;
++import android.widget.ProgressBar;
++import android.widget.TextView;
++
++/**
++ * Live TV: the IPTV website's own player, shown full screen in an embedded WebView.
++ *
++ * The page is loaded as-is (default user agent, JavaScript, DOM storage, cookies, the site's own
++ * licensing/DRM requests). Nothing is rewritten or bypassed. Only the Android plumbing is here:
++ * loading spinner, error + Retry, fullscreen video, remote keys, and Back to Home.
++ *
++ * Back: closes fullscreen video first, then steps back through the site's history, then exits to
++ * the launcher. Holding Back for 1 s exits straight to the launcher from anywhere.
++ */
++public class LiveTvActivity extends Activity {
++    static final String URL = "https://zero.viulk.xyz";
++    static final String HOST = "zero.viulk.xyz";
++    static final long LONG_BACK_MS = 1000;
++
++    private FrameLayout root;
++    private WebView web;
++    private ProgressBar spinner;
++    private LinearLayout errorBox;
++    private TextView errorText;
++    private TextView retryBtn;
++
++    private WebChromeClient chrome;  // WebView.getWebChromeClient() needs API 26; minSdk is 24
++    private View customView;
++    private WebChromeClient.CustomViewCallback customCallback;
++    private boolean failed;
++    private boolean backHandledByLongPress;
++
++    @Override
++    protected void onCreate(Bundle b) {
++        super.onCreate(b);
++        root = new FrameLayout(this);
++        root.setBackgroundColor(Color.BLACK);
++
++        web = new WebView(this);
++        web.setBackgroundColor(Color.BLACK);
++        web.setFocusable(true);
++        web.setFocusableInTouchMode(true);
++        root.addView(web, new FrameLayout.LayoutParams(-1, -1));
++
++        spinner = new ProgressBar(this);
++        int sp = Ui.px(this, 40);
++        FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(sp, sp, Gravity.CENTER);
++        root.addView(spinner, slp);
++
++        buildErrorBox();
++        setContentView(root);
++
++        CookieManager cm = CookieManager.getInstance();
++        cm.setAcceptCookie(true);
++        cm.setAcceptThirdPartyCookies(web, true);
++
++        WebSettings s = web.getSettings();
++        s.setJavaScriptEnabled(true);
++        s.setDomStorageEnabled(true);
++        s.setMediaPlaybackRequiresUserGesture(false);
++        s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
++        s.setCacheMode(WebSettings.LOAD_DEFAULT);
++
++        web.setWebViewClient(new WebViewClient() {
++            @Override public void onPageStarted(WebView v, String url, android.graphics.Bitmap icon) {
++                failed = false;
++                errorBox.setVisibility(View.GONE);
++                spinner.setVisibility(View.VISIBLE);
++            }
++
++            @Override public void onPageFinished(WebView v, String url) {
++                if (!failed) spinner.setVisibility(View.GONE);
++            }
++
++            @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
++                String scheme = r.getUrl().getScheme();
++                // Keep web navigation (including the site's own redirects) inside the WebView;
++                // drop app-hand-off schemes (intent:, market:) that would leave the launcher.
++                return !("https".equals(scheme) || "http".equals(scheme));
++            }
++
++            @Override public void onReceivedError(WebView v, WebResourceRequest r, WebResourceError e) {
++                if (r.isForMainFrame()) showError("Can't reach Live TV (" + e.getDescription() + ")");
++            }
++
++            @Override public void onReceivedHttpError(WebView v, WebResourceRequest r, WebResourceResponse e) {
++                if (r.isForMainFrame() && e.getStatusCode() >= 500) {
++                    showError("Live TV is unavailable (HTTP " + e.getStatusCode() + ")");
++                }
++            }
++
++            @Override public void onReceivedSslError(WebView v, SslErrorHandler h, SslError e) {
++                h.cancel();  // never proceed past a certificate problem
++                showError("Secure connection failed (certificate error)");
++            }
++        });
++
++        chrome = new WebChromeClient() {
++            @Override public void onProgressChanged(WebView v, int p) {
++                if (!failed) spinner.setVisibility(p < 100 ? View.VISIBLE : View.GONE);
++            }
++
++            // Widevine/EME: the page asks for protected-media access; allow it for the site only.
++            @Override public void onPermissionRequest(PermissionRequest req) {
++                if (HOST.equals(req.getOrigin().getHost())) {
++                    java.util.ArrayList<String> ok = new java.util.ArrayList<>();
++                    for (String r : req.getResources()) {
++                        if (PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID.equals(r)) ok.add(r);
++                    }
++                    if (ok.isEmpty()) req.deny();
++                    else req.grant(ok.toArray(new String[0]));
++                } else {
++                    req.deny();
++                }
++            }
++
++            @Override public void onShowCustomView(View v, CustomViewCallback cb) {
++                if (customView != null) {
++                    cb.onCustomViewHidden();
++                    return;
++                }
++                customView = v;
++                customCallback = cb;
++                root.addView(v, new FrameLayout.LayoutParams(-1, -1));
++                web.setVisibility(View.INVISIBLE);
++                hideSystemBars();
++            }
++
++            @Override public void onHideCustomView() {
++                if (customView == null) return;
++                root.removeView(customView);
++                customView = null;
++                if (customCallback != null) customCallback.onCustomViewHidden();
++                customCallback = null;
++                web.setVisibility(View.VISIBLE);
++                web.requestFocus();
++            }
++        };
++        web.setWebChromeClient(chrome);
++
++        if (b != null) web.restoreState(b);
++        else web.loadUrl(URL);
++        web.requestFocus();
++    }
++
++    // ------------------------------------------------------------------ error + retry
++
++    private void buildErrorBox() {
++        errorBox = new LinearLayout(this);
++        errorBox.setOrientation(LinearLayout.VERTICAL);
++        errorBox.setGravity(Gravity.CENTER);
++        errorBox.setBackgroundColor(Color.BLACK);
++        errorBox.setVisibility(View.GONE);
++
++        errorText = new TextView(this);
++        errorText.setTextColor(Color.WHITE);
++        errorText.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, Ui.px(this, 18));
++        errorText.setGravity(Gravity.CENTER);
++        errorBox.addView(errorText, new LinearLayout.LayoutParams(-2, -2));
++
++        retryBtn = new TextView(this);
++        retryBtn.setText("Retry");
++        retryBtn.setTypeface(Typeface.DEFAULT_BOLD);
++        retryBtn.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, Ui.px(this, 16));
++        retryBtn.setGravity(Gravity.CENTER);
++        retryBtn.setFocusable(true);
++        retryBtn.setClickable(true);
++        retryBtn.setPadding(Ui.px(this, 36), Ui.px(this, 12), Ui.px(this, 36), Ui.px(this, 12));
++        styleRetry(false);
++        retryBtn.setOnFocusChangeListener((v, f) -> styleRetry(f));
++        retryBtn.setOnClickListener(v -> retry());
++        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
++        lp.topMargin = Ui.px(this, 24);
++        errorBox.addView(retryBtn, lp);
++
++        root.addView(errorBox, new FrameLayout.LayoutParams(
++                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
++    }
++
++    private void styleRetry(boolean focused) {
++        GradientDrawable g = new GradientDrawable();
++        g.setCornerRadius(Ui.px(this, 10));
++        g.setColor(focused ? Color.WHITE : 0xFF3A3A3C);
++        retryBtn.setBackground(g);
++        retryBtn.setTextColor(focused ? Color.BLACK : Color.WHITE);
++    }
++
++    private void showError(String msg) {
++        failed = true;
++        spinner.setVisibility(View.GONE);
++        errorText.setText(msg);
++        errorBox.setVisibility(View.VISIBLE);
++        retryBtn.requestFocus();
++    }
++
++    private void retry() {
++        failed = false;
++        errorBox.setVisibility(View.GONE);
++        spinner.setVisibility(View.VISIBLE);
++        String u = web.getUrl();
++        if (u == null || u.startsWith("data:") || u.equals("about:blank")) web.loadUrl(URL);
++        else web.reload();
++        web.requestFocus();
++    }
++
++    // ------------------------------------------------------------------ keys / Back
++
++    @Override
++    public boolean dispatchKeyEvent(KeyEvent e) {
++        if (e.getKeyCode() != KeyEvent.KEYCODE_BACK) return super.dispatchKeyEvent(e);
++        if (e.getAction() == KeyEvent.ACTION_DOWN) {
++            if (e.getRepeatCount() == 0) backHandledByLongPress = false;
++            if (e.isLongPress() || (e.getEventTime() - e.getDownTime() >= LONG_BACK_MS)) {
++                if (!backHandledByLongPress) {
++                    backHandledByLongPress = true;
++                    finish();  // straight back to Home
++                }
++            }
++            return true;
++        }
++        if (e.getAction() == KeyEvent.ACTION_UP && !backHandledByLongPress && !e.isCanceled()) {
++            goBackOneStep();
++        }
++        return true;
++    }
++
++    private void goBackOneStep() {
++        if (customView != null) {
++            chrome.onHideCustomView();
++        } else if (!failed && web.canGoBack()) {
++            web.goBack();
++        } else {
++            finish();
++        }
++    }
++
++    private void hideSystemBars() {
++        getWindow().getDecorView().setSystemUiVisibility(
++                View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
++                        | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
++    }
++
++    // ------------------------------------------------------------------ lifecycle
++
++    @Override protected void onSaveInstanceState(Bundle o) {
++        super.onSaveInstanceState(o);
++        web.saveState(o);
++    }
++
++    @Override protected void onResume() {
++        super.onResume();
++        web.onResume();
++    }
++
++    @Override protected void onPause() {
++        web.onPause();  // stops playback when leaving to Home
++        CookieManager.getInstance().flush();  // keep the session/licence cookies
++        super.onPause();
++    }
++
++    @Override protected void onDestroy() {
++        if (customCallback != null) customCallback.onCustomViewHidden();
++        root.removeAllViews();
++        web.destroy();
++        super.onDestroy();
++    }
++}
+diff -ruN a/hume-launcher-main/src/com/petrobot/hume/MainActivity.java b/hume-launcher-main/src/com/petrobot/hume/MainActivity.java
+--- a/hume-launcher-main/src/com/petrobot/hume/MainActivity.java	2026-10-28 20:02:03.000000000 +0000
++++ b/hume-launcher-main/src/com/petrobot/hume/MainActivity.java	2026-10-29 10:05:29.256912435 +0000
+@@ -78,6 +78,7 @@
+     static final String SETTINGS_KEY = "special:settings";
+     static final String PRESENT_KEY = "special:present";
+     static final String INPUTS_KEY = "special:inputs";
++    static final String LIVETV_KEY = "special:livetv";
+     static final String FOLDER_KEY = "special:folder";
+     static final String PREF_ORDER = "order";
+     static final String PREF_HIDDEN = "hidden";
+@@ -2839,6 +2840,7 @@
+         addResolved(pm, Intent.CATEGORY_LAUNCHER, pkgs, false);
+         if (!pkgs.contains(TV_SETTINGS)) addSettingsEntry(pm);
+         if (com.petrobot.hume.present.Presenter.enabled(this)) addPresentEntry();
++        addLiveTvEntry();
+         inputs = Inputs.list(this);
+         if (Inputs.showCard(this) && !inputs.isEmpty()) addInputsEntry();
+         for (AppEntry e : all.values()) {
+@@ -2896,6 +2898,7 @@
+ 
+     int priority(AppEntry e) {
+         if (INPUTS_KEY.equals(e.key)) return -1;
++        if (LIVETV_KEY.equals(e.key)) return -1;
+         if (isSettings(e)) return 2000;
+         if (PRESENT_KEY.equals(e.key)) return 1999;
+         int i = DEFAULT_ORDER.indexOf(e.pkg);
+@@ -2929,6 +2932,28 @@
+         all.put(e.key, e);
+     }
+ 
++    /** Live TV tile: opens the IPTV website's own player in LiveTvActivity (embedded WebView). */
++    void addLiveTvEntry() {
++        AppEntry e = new AppEntry();
++        e.key = LIVETV_KEY;
++        e.pkg = getPackageName();
++        e.label = "Live TV";
++        e.system = true;
++        e.color = 0xFFDC2626;
++        e.launch = new Intent(this, LiveTvActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++        int w = 640, h = 384;
++        Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
++        Canvas c = new Canvas(b);
++        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.DITHER_FLAG);
++        p.setShader(new LinearGradient(0, 0, w, h, 0xFFEF4444, 0xFF991B1B, Shader.TileMode.CLAMP));
++        c.drawRect(0, 0, w, h, p);
++        Bitmap g = Glyphs.get("antenna", (int) (h * 0.5f), Color.WHITE);
++        c.drawBitmap(g, (w - g.getWidth()) / 2f, (h - g.getHeight()) / 2f, null);
++        e.banner = new BitmapDrawable(getResources(), b);
++        e.icon = e.banner;
++        all.put(e.key, e);
++    }
++
+     /** Presentation tile (shown while Presentation mode is on): tvOS-style card. */
+     void addPresentEntry() {
+         AppEntry e = new AppEntry();
+@@ -3066,7 +3091,7 @@
+                 actions.add(() -> setHidden(a, true));
+             }
+         }
+-        if (!isSettings(a) && !INPUTS_KEY.equals(a.key)) {
++        if (!isSettings(a) && !INPUTS_KEY.equals(a.key) && !LIVETV_KEY.equals(a.key)) {
+             labels.add("App Info");
+             actions.add(() -> startSafe(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                     Uri.parse("package:" + a.pkg))));
