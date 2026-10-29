@@ -1,26 +1,39 @@
-name: Build APK
+
+name: Build APK with Live TV
 
 on:
-  push:
   workflow_dispatch:
+  push:
+    branches:
+      - shahidhajraz-patch-1
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
+      - name: Check patch file
+        run: |
+          test -f live-tv.patch
+          git apply --check live-tv.patch
+
+      - name: Apply Live TV patch
+        run: git apply live-tv.patch
 
       - name: Install Android SDK pieces
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;34.0.0" "platforms;android-34"
 
-      - name: Build
+      - name: Build APK
         working-directory: hume-launcher-main
         run: |
           chmod +x build.sh
@@ -29,5 +42,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: hume-launcher-apk
+          name: hume-launcher-live-tv-apk
           path: hume-launcher-main/build/tvos-home.apk
